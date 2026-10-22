@@ -370,6 +370,9 @@ func diagTLS(ctx context.Context, raw net.Conn, t *target, opts *Options) (_ net
 	}
 	res.Summary = info[0]
 	res.Details = append(info[1:], certInfo...)
+	if opts.ServerName != "" {
+		res.Details = append([]string{"server name (SNI): " + sni}, res.Details...)
+	}
 	if opts.InsecureSkipVerify {
 		res.Details = append(res.Details, "certificate verification was skipped (-insecure)")
 	}
