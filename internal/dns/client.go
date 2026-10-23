@@ -4,10 +4,10 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -20,13 +20,24 @@ import (
 // Config describes how to resolve names, normally read from
 // /etc/resolv.conf.
 type Config struct {
-	Servers  []string // "ip:port"
+	// Servers lists DNS servers in preference order. Each entry is either a
+	// bare "ip[:port]" (cleartext UDP, falling back to TCP on truncation)
+	// or a scheme-prefixed encrypted transport understood by parseServer:
+	// udp://, tcp://, tls:// (DoT), https:// (DoH) or quic:// (DoQ).
+	Servers  []string
 	Search   []string
 	Ndots    int
 	Timeout  time.Duration // per exchange
 	Attempts int
 	// HostsFile is consulted before DNS if set (normally /etc/hosts).
 	HostsFile string
+
+	// TLSRoots is the trust anchor set for the certificates of DoT, DoH and
+	// DoQ servers. A nil pool uses the system roots.
+	TLSRoots *x509.CertPool
+	// TLSInsecureSkipVerify disables certificate verification for encrypted
+	// transports. For diagnostics only.
+	TLSInsecureSkipVerify bool
 }
 
 // DefaultConfig reads /etc/resolv.conf, falling back to a local resolver
@@ -316,11 +327,18 @@ func (c *Client) query(ctx context.Context, name string, qtype Type) (*Message, 
 			if ctx.Err() != nil {
 				return nil, exchanges, &Error{Kind: ErrTimeout, Name: name, Err: ctx.Err()}
 			}
-			m, ex := c.exchange(ctx, server, "udp", name, qtype, timeout)
+			spec, err := parseServer(server)
+			if err != nil {
+				lastErr = &Error{Kind: ErrNetwork, Name: name, Server: server, Err: err}
+				continue
+			}
+			m, ex := c.exchange(ctx, spec, name, qtype, timeout)
 			exchanges = append(exchanges, ex)
-			if ex.Err == nil && m.Truncated {
+			if ex.Err == nil && m.Truncated && spec.scheme == "udp" {
 				// Retry over TCP for the full answer (RFC 7766).
-				m, ex = c.exchange(ctx, server, "tcp", name, qtype, timeout)
+				tcpSpec := spec
+				tcpSpec.scheme = "tcp"
+				m, ex = c.exchange(ctx, tcpSpec, name, qtype, timeout)
 				exchanges = append(exchanges, ex)
 			}
 			if ex.Err != nil {
@@ -360,10 +378,10 @@ func classifyNetError(name, server string, err error) *Error {
 
 var errMismatch = errors.New("response does not match the query")
 
-func (c *Client) exchange(ctx context.Context, server, proto, name string, qtype Type, timeout time.Duration) (*Message, Exchange) {
-	ex := Exchange{Server: server, Proto: proto, Name: name, Type: qtype}
+func (c *Client) exchange(ctx context.Context, spec serverSpec, name string, qtype Type, timeout time.Duration) (*Message, Exchange) {
+	ex := Exchange{Server: spec.display, Proto: spec.scheme, Name: name, Type: qtype}
 	start := time.Now()
-	m, err := c.roundTrip(ctx, server, proto, name, qtype, timeout)
+	m, err := c.roundTrip(ctx, spec, name, qtype, timeout)
 	ex.RTT = time.Since(start)
 	ex.Err = err
 	if m != nil {
@@ -372,22 +390,32 @@ func (c *Client) exchange(ctx context.Context, server, proto, name string, qtype
 	return m, ex
 }
 
-func (c *Client) roundTrip(ctx context.Context, server, proto, name string, qtype Type, timeout time.Duration) (*Message, error) {
-	var idb [2]byte
-	rand.Read(idb[:])
-	id := binary.BigEndian.Uint16(idb[:])
+func (c *Client) roundTrip(ctx context.Context, spec serverSpec, name string, qtype Type, timeout time.Duration) (*Message, error) {
+	// DoH and DoQ recommend a zero message ID (RFC 8484 §4.1, RFC 9250
+	// §4.2.1); the other transports use a random ID to match replies.
+	var id uint16
+	if !(spec.scheme == "https" || spec.scheme == "quic") {
+		var idb [2]byte
+		rand.Read(idb[:])
+		id = binary.BigEndian.Uint16(idb[:])
+	}
 	query, err := buildQuery(id, name, qtype)
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	dial := c.Dial
-	if dial == nil {
-		var d net.Dialer
-		dial = d.DialContext
+
+	switch spec.scheme {
+	case "tls":
+		return c.roundTripDoT(ctx, spec, id, query, name, qtype)
+	case "https":
+		return c.roundTripDoH(ctx, spec, query, name, qtype)
+	case "quic":
+		return c.roundTripDoQ(ctx, spec, query, name, qtype)
 	}
-	conn, err := dial(ctx, proto, server)
+
+	conn, err := c.rawDial(ctx, spec.scheme, spec.addr)
 	if err != nil {
 		return nil, err
 	}
@@ -396,17 +424,12 @@ func (c *Client) roundTrip(ctx context.Context, server, proto, name string, qtyp
 		conn.SetDeadline(dl)
 	}
 
-	if proto == "tcp" {
-		msg := binary.BigEndian.AppendUint16(nil, uint16(len(query)))
-		if _, err := conn.Write(append(msg, query...)); err != nil {
+	if spec.scheme == "tcp" {
+		if err := writePrefixed(conn, query); err != nil {
 			return nil, err
 		}
-		var lb [2]byte
-		if _, err := io.ReadFull(conn, lb[:]); err != nil {
-			return nil, err
-		}
-		resp := make([]byte, binary.BigEndian.Uint16(lb[:]))
-		if _, err := io.ReadFull(conn, resp); err != nil {
+		resp, err := readPrefixed(conn)
+		if err != nil {
 			return nil, err
 		}
 		return checkResponse(resp, id, name, qtype)

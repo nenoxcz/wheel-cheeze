@@ -36,7 +36,7 @@ func main() {
 		deadline = flag.Duration("deadline", 0, "overall time limit (default: none)")
 	)
 	flag.DurationVar(&opts.Timeout, "timeout", 5*time.Second, "time limit per stage")
-	flag.StringVar(&opts.DNSServer, "dns", "", "query this DNS server (ip[:port]) instead of /etc/resolv.conf")
+	flag.StringVar(&opts.DNSServer, "dns", "", "query this DNS server instead of /etc/resolv.conf;\n\t\taccepts ip[:port], tls://ip#name (DoT), https://host/dns-query (DoH), quic://host (DoQ)")
 	flag.BoolVar(&opts.SystemResolver, "system-resolver", false, "use the operating system resolver instead of querying DNS directly")
 	flag.StringVar(&opts.TLSImpl, "tls", "stdlib", "TLS client: stdlib (crypto/tls, TLS 1.0-1.3) or wheel (this repository's TLS 1.3)")
 	flag.BoolVar(&opts.InsecureSkipVerify, "insecure", false, "report certificate problems without failing the TLS stage")

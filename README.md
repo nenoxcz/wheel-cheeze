@@ -73,6 +73,12 @@ target: 127.0.0.1 port 18444 (https), path /
 설계상 특징:
 
 - **DNS는 직접 질의합니다.** OS 리졸버는 실패를 "host not found" 하나로 뭉뚱그리기 때문에, [`internal/dns`](internal/dns)에서 DNS 와이어 프로토콜(RFC 1035)을 직접 구현했습니다. `/etc/resolv.conf`(nameserver, search, ndots, timeout, attempts)와 `/etc/hosts`를 읽고, UDP로 A/AAAA를 동시에 질의하며 EDNS(0)을 쓰고, TC 비트가 오면 TCP로 재시도합니다. 서버별로 어떤 응답(NXDOMAIN/SERVFAIL/무응답 …)이 왔는지 그대로 보여줍니다. `-system-resolver`로 OS 리졸버를 쓸 수도 있습니다.
+- **암호화 DNS로 차단·변조를 우회합니다.** 평문 DNS(UDP/53)는 중간 장비가 그대로 읽고 위조·차단할 수 있습니다(진단기가 `dns.malformed`로 탐지). `-dns`에 스킴을 붙이면 같은 조회를 인증된 채널로 보냅니다 — **DoT**(`tls://`, RFC 7858), **DoH**(`https://`, RFC 8484), **DoQ**(`quic://`, RFC 9250). 세 전송 모두 이 저장소의 TLS 1.3·QUIC 위에서 동작하고, 서버 인증서는 `-cacert`/시스템 루트로 검증합니다. 즉 평문 DNS가 가로채이는 환경에서 진단기가 **진짜 응답을 받아올** 수 있습니다. 브라우저·OS에 내장된 것과 같은 표준 프라이버시 기능입니다.
+  ```
+  netdiag -dns tls://1.1.1.1#cloudflare-dns.com     https://example.com/
+  netdiag -dns https://dns.google/dns-query         https://example.com/
+  netdiag -dns quic://dns.adguard.com               https://example.com/
+  ```
 - **인증서가 거부되어도 내용을 보여줍니다.** 검증을 콜백 안에서 직접 수행해, 만료·이름 불일치·신뢰 불가 상황에서도 주체·SAN·발급자·만료일·체인 길이를 출력합니다.
 - **TLS 구현을 고를 수 있습니다.** 기본은 `crypto/tls`(TLS 1.0~1.3을 받아들여 오래된 서버도 진단)이고, `-tls wheel`을 주면 이 저장소의 TLS 1.3 구현으로 핸드셰이크합니다.
 - **종료 코드**: `0` 정상(경고 포함), `2` DNS, `3` TCP, `4` TLS, `5` HTTP, `1` 사용법 오류.
@@ -82,7 +88,8 @@ target: 127.0.0.1 port 18444 (https), path /
 ```
 netdiag [flags] URL          # URL: https://host/path, http://host:8080, host:port, host
 
-  -dns 1.1.1.1         /etc/resolv.conf 대신 이 DNS 서버에 질의
+  -dns SERVER          /etc/resolv.conf 대신 이 DNS 서버에 질의
+                       ip[:port] (평문) | tls://ip#name (DoT) | https://host/dns-query (DoH) | quic://host (DoQ)
   -system-resolver     OS 리졸버 사용
   -4 / -6              IPv4 / IPv6 주소만 시도
   -tls stdlib|wheel    TLS 클라이언트 선택 (wheel = 이 저장소의 TLS 1.3)
@@ -172,7 +179,8 @@ bin/wheelcat -quic -insecure -v localhost:4433 < big.bin   # -v: QUIC 이벤트 
 | TLS 1.3 | `crypto/tls`와 **양방향** 상호운용 (스위트 3종 × 키 5종, HRR, mTLS, KeyUpdate, 익스포터 값 일치, 1 MiB 전송), 실패 시나리오(호스트명·CA·만료·버전·ALPN·비TLS 응답), QUIC 모드를 `crypto/tls`의 `QUICConn`과 연결해 양쪽 시크릿 일치 확인, 메시지 파서 퍼징 |
 | QUIC | RFC 9001 부록 A 벡터(Initial 시크릿, ChaCha20 숏 헤더 패킷, Retry 태그), 루프백 테스트(10% 손실·10% 재정렬 링크, 수 MB 동시 스트림, 스트림 한도 갱신, Retry, 키 업데이트, idle/keep-alive, 리셋, 버전 협상), **quic-go와 양방향 상호운용**(스위트 3종, 5 MB 전송 중 quic-go가 시작하는 키 업데이트, Retry, 스트림 250개, 애플리케이션 종료) |
 | DNS 클라이언트 | 가짜 DNS 서버로 CNAME 체인, NXDOMAIN/NODATA/SERVFAIL/REFUSED, 타임아웃, 서버 폴백, TC→TCP, 위조 ID 무시, search 목록, hosts 파일 테스트 + 파서 퍼징 |
-| netdiag | 결함을 주입하는 로컬 서버(가짜 DNS, 닫힌 포트, 만료/이름 불일치/자체 서명 인증서, 평문 HTTP, 침묵·끊는 서버, TLS 1.2 전용 서버, 5xx, 비HTTP 응답, QUIC)로 단계·코드 판정 검증 |
+| 암호화 DNS | `tls13`·`quic`로 세운 루프백 DoT/DoH/DoQ 서버에 조회해 왕복 확인, NXDOMAIN 등 RCode 전달, 신뢰할 수 없는 인증서·DoH의 비dns-message 응답 거부, `parseServer` 스킴 파싱 테스트 |
+| netdiag | 결함을 주입하는 로컬 서버(가짜 DNS, 닫힌 포트, 만료/이름 불일치/자체 서명 인증서, 평문 HTTP, 침묵·끊는 서버, TLS 1.2 전용 서버, 5xx, 비HTTP 응답, QUIC, DoT로 해석하는 전체 경로)로 단계·코드 판정 검증 |
 
 `go test -race ./...`가 깨끗하게 통과합니다. 상호운용 테스트는 의존성을 메인 모듈에서 분리하려고 별도 모듈([`interop/`](interop))에 있습니다.
 

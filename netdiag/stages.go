@@ -55,13 +55,11 @@ func diagDNS(ctx context.Context, t *target, opts *Options) (_ []net.IP, res Res
 			cfg.HostsFile = opts.HostsFile
 		}
 		if opts.DNSServer != "" {
-			server := opts.DNSServer
-			if _, _, err := net.SplitHostPort(server); err != nil {
-				server = net.JoinHostPort(strings.Trim(server, "[]"), "53")
-			}
-			cfg.Servers = []string{server}
+			cfg.Servers = []string{normalizeDNSServer(opts.DNSServer)}
 			cfg.Search = nil
 		}
+		cfg.TLSRoots = opts.RootCAs
+		cfg.TLSInsecureSkipVerify = opts.InsecureSkipVerify
 		cfg.Timeout = min(cfg.Timeout, max(opts.timeout()/2, 200*time.Millisecond))
 		client := &dns.Client{Config: cfg}
 		lr, err := client.LookupHost(ctx, t.host)
@@ -74,6 +72,9 @@ func diagDNS(ctx context.Context, t *target, opts *Options) (_ []net.IP, res Res
 		}
 		addrs = lr.Addrs
 		res.Summary = fmt.Sprintf("%s -> %s", t.host, joinAddrs(addrs, 4))
+		if transport := dnsTransportName(lr.Source); transport != "" {
+			res.Details = append([]string{"resolved over " + transport}, res.Details...)
+		}
 		if lr.Name != t.host {
 			res.Details = append([]string{"resolved as " + lr.Name + " (search list)"}, res.Details...)
 		}
@@ -108,6 +109,35 @@ func diagDNS(ctx context.Context, t *target, opts *Options) (_ []net.IP, res Res
 	return ips, res
 }
 
+// normalizeDNSServer adds a default port to a bare "ip" server, and leaves
+// scheme-prefixed encrypted-DNS specs (tls://, https://, quic://, ...)
+// untouched.
+func normalizeDNSServer(s string) string {
+	if strings.Contains(s, "://") {
+		return s
+	}
+	if _, _, err := net.SplitHostPort(s); err != nil {
+		return net.JoinHostPort(strings.Trim(s, "[]"), "53")
+	}
+	return s
+}
+
+// dnsTransportName names the encrypted transport that answered, for the DNS
+// stage details. Plaintext UDP, the default, gets no note.
+func dnsTransportName(source string) string {
+	switch {
+	case strings.HasPrefix(source, "tls://"):
+		return "DoT (DNS over TLS): " + source
+	case strings.HasPrefix(source, "https://"):
+		return "DoH (DNS over HTTPS): " + source
+	case strings.HasPrefix(source, "quic://"):
+		return "DoQ (DNS over QUIC): " + source
+	case strings.HasPrefix(source, "tcp://"):
+		return "cleartext TCP: " + source
+	}
+	return ""
+}
+
 func joinAddrs(addrs []netip.Addr, limit int) string {
 	var s []string
 	for i, a := range addrs {
@@ -120,6 +150,15 @@ func joinAddrs(addrs []netip.Addr, limit int) string {
 	return strings.Join(s, ", ")
 }
 
+// exchangeLabel names a query's server, appending the transport only when
+// it is not already evident from a scheme in the server string.
+func exchangeLabel(ex dns.Exchange) string {
+	if strings.Contains(ex.Server, "://") {
+		return ex.Server
+	}
+	return ex.Server + "/" + ex.Proto
+}
+
 // exchangeDetails summarizes the queries that did not simply succeed.
 func exchangeDetails(exs []dns.Exchange) []string {
 	var out []string
@@ -127,7 +166,7 @@ func exchangeDetails(exs []dns.Exchange) []string {
 	for _, ex := range exs {
 		if ex.Err == nil && ex.RCode == dns.RCodeSuccess {
 			if answered == "" {
-				answered = fmt.Sprintf("answered by %s/%s in %s", ex.Server, ex.Proto, roundDur(ex.RTT))
+				answered = fmt.Sprintf("answered by %s in %s", exchangeLabel(ex), roundDur(ex.RTT))
 			}
 			continue
 		}
@@ -141,7 +180,7 @@ func exchangeDetails(exs []dns.Exchange) []string {
 			}
 		}
 		if len(out) < 6 {
-			out = append(out, fmt.Sprintf("%s/%s %s %s: %s", ex.Server, ex.Proto, ex.Name, ex.Type, what))
+			out = append(out, fmt.Sprintf("%s %s %s: %s", exchangeLabel(ex), ex.Name, ex.Type, what))
 		}
 	}
 	if answered != "" {
@@ -409,7 +448,11 @@ func describeCerts(certs []*x509.Certificate, opts *Options) (lines []string, ex
 		warn = 14 * 24 * time.Hour
 	}
 	if left > 0 && left < warn {
-		expiring = fmt.Sprintf("the certificate expires in %s; renew it soon", daysLeft(left))
+		when := "less than a day"
+		if days := int(left.Hours() / 24); days > 0 {
+			when = fmt.Sprintf("%d days", days)
+		}
+		expiring = fmt.Sprintf("the certificate expires in %s; renew it soon", when)
 	}
 	return lines, expiring
 }

@@ -3,6 +3,7 @@ package netdiag
 import (
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -85,6 +86,35 @@ func validLeaf(t *testing.T) tls.Certificate {
 
 // Fake DNS server: app.test and others resolve to 127.0.0.1.
 
+// buildDNSResponse answers a raw DNS query per behavior, returning nil when
+// the query should be dropped.
+func buildDNSResponse(q []byte, behavior func(name string) (rcode byte, answer bool, drop bool)) []byte {
+	// Parse the question name (no compression in queries).
+	off := 12
+	var labels []string
+	for off < len(q) && q[off] != 0 {
+		l := int(q[off])
+		labels = append(labels, string(q[off+1:off+1+l]))
+		off += 1 + l
+	}
+	qend := off + 5
+	qtype := binary.BigEndian.Uint16(q[off+1:])
+	rcode, answer, drop := behavior(strings.Join(labels, "."))
+	if drop {
+		return nil
+	}
+	resp := append([]byte(nil), q[:qend]...)
+	binary.BigEndian.PutUint16(resp[2:], 0x8180|uint16(rcode))
+	binary.BigEndian.PutUint16(resp[6:], 0)
+	binary.BigEndian.PutUint16(resp[8:], 0)
+	binary.BigEndian.PutUint16(resp[10:], 0)
+	if answer && qtype == 1 && rcode == 0 {
+		binary.BigEndian.PutUint16(resp[6:], 1)
+		resp = append(resp, 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1)
+	}
+	return resp
+}
+
 func startDNS(t *testing.T, behavior func(name string) (rcode byte, answer bool, drop bool)) string {
 	t.Helper()
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -99,34 +129,55 @@ func startDNS(t *testing.T, behavior func(name string) (rcode byte, answer bool,
 			if err != nil {
 				return
 			}
-			q := buf[:n]
-			// Parse the question name (no compression in queries).
-			off := 12
-			var labels []string
-			for off < n && q[off] != 0 {
-				l := int(q[off])
-				labels = append(labels, string(q[off+1:off+1+l]))
-				off += 1 + l
+			if resp := buildDNSResponse(buf[:n], behavior); resp != nil {
+				pc.WriteTo(resp, addr)
 			}
-			qend := off + 5
-			qtype := binary.BigEndian.Uint16(q[off+1:])
-			rcode, answer, drop := behavior(strings.Join(labels, "."))
-			if drop {
-				continue
-			}
-			resp := append([]byte(nil), q[:qend]...)
-			binary.BigEndian.PutUint16(resp[2:], 0x8180|uint16(rcode))
-			binary.BigEndian.PutUint16(resp[6:], 0)
-			binary.BigEndian.PutUint16(resp[8:], 0)
-			binary.BigEndian.PutUint16(resp[10:], 0)
-			if answer && qtype == 1 && rcode == 0 {
-				binary.BigEndian.PutUint16(resp[6:], 1)
-				resp = append(resp, 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1)
-			}
-			pc.WriteTo(resp, addr)
 		}
 	}()
 	return pc.LocalAddr().String()
+}
+
+// startDoTServer runs a DNS-over-TLS server on this repository's TLS 1.3,
+// answering with buildDNSResponse. It returns a tls:// server spec.
+func startDoTServer(t *testing.T, behavior func(name string) (rcode byte, answer bool, drop bool)) string {
+	t.Helper()
+	c := validLeaf(t)
+	ln, err := tls13.Listen("tcp", "127.0.0.1:0", &tls13.Config{
+		Certificates: []tls13.Certificate{{Certificate: c.Certificate, PrivateKey: c.PrivateKey.(crypto.Signer)}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				for {
+					conn.SetDeadline(time.Now().Add(2 * time.Second))
+					var lb [2]byte
+					if _, err := io.ReadFull(conn, lb[:]); err != nil {
+						return
+					}
+					q := make([]byte, binary.BigEndian.Uint16(lb[:]))
+					if _, err := io.ReadFull(conn, q); err != nil {
+						return
+					}
+					resp := buildDNSResponse(q, behavior)
+					if resp == nil {
+						return
+					}
+					out := binary.BigEndian.AppendUint16(nil, uint16(len(resp)))
+					conn.Write(append(out, resp...))
+				}
+			}()
+		}
+	}()
+	return "tls://" + ln.Addr().String() // hostname 127.0.0.1 matches the leaf IP SAN
 }
 
 func goodDNS(t *testing.T) string {
@@ -479,6 +530,35 @@ func TestQUICProbe(t *testing.T) {
 	res := expect(t, r, StageQUIC, StatusOK, "")
 	if !strings.Contains(res.Summary, "ALPN h3") {
 		t.Fatalf("summary %q", res.Summary)
+	}
+}
+
+func TestEncryptedDNSResolver(t *testing.T) {
+	// A full DNS -> TCP -> TLS -> HTTP run where the name is resolved over
+	// DNS-over-TLS instead of cleartext UDP, as a censorship-circumvention
+	// resolver would. app.example resolves to 127.0.0.1, where an HTTPS
+	// server is listening.
+	dot := startDoTServer(t, func(name string) (byte, bool, bool) {
+		if name == "app.test" {
+			return 0, true, false
+		}
+		return 3, false, false
+	})
+	port := startHTTPS(t, validLeaf(t), 0)
+	r := run(t, "https://app.test:"+port+"/", Options{
+		DNSServer: dot,
+		RootCAs:   getCA().pool,
+	})
+	dnsRes := expect(t, r, StageDNS, StatusOK, "")
+	if !strings.Contains(strings.Join(dnsRes.Details, "\n"), "DoT (DNS over TLS)") {
+		t.Fatalf("DNS stage does not mention DoT: %v", dnsRes.Details)
+	}
+	if !strings.Contains(dnsRes.Summary, "127.0.0.1") {
+		t.Fatalf("DNS summary %q", dnsRes.Summary)
+	}
+	expect(t, r, StageHTTP, StatusOK, "")
+	if !r.OK {
+		t.Fatalf("run not OK: failed at %s", r.FailedStage)
 	}
 }
 
